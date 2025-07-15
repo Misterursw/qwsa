@@ -167,24 +167,29 @@ class ValDataset(torch.utils.data.Dataset):
         self.transform = ResizeLongestSide(image_size)
         self.data_type = ""
         self.data_list = []
+        # ==================== 修改开始 ====================
+        self.val_data = [] # 用于存储从JSON加载的复杂问答数据
 
         splits = val_dataset.split("|")
-        if len(splits) == 2:
+        # 强制使用 ReasonSeg 类型的复杂验证集
+        # 例如: --val_dataset "ReasonSeg|val_explanatory"
+        if len(splits) == 2 and splits[0] == "ReasonSeg":
             ds, split = splits
-            self.data_list = glob.glob(os.path.join(self.base_image_dir, "reason_seg", ds, split, "*.jpg"))
-            self.data_type = "reason_seg"
-        elif len(splits) == 3:
-            ds, splitBy, split = splits
-            refer_api = REFER(self.base_image_dir, ds, splitBy)
-            ref_ids_val = refer_api.getRefIds(split=split)
-            images_ids_val = refer_api.getImgIds(ref_ids=ref_ids_val)
-            self.data_list = refer_api.loadImgs(image_ids=images_ids_val)
-            
-            self.refer_api = refer_api
-            self.data_type = "refer_seg"
+            # 假设您的复杂验证集JSON位于 .../explanatory/val.json
+            val_json_path = os.path.join(self.base_image_dir, "reason_seg", ds, "explanatory", f"{split}.json")
+            if os.path.exists(val_json_path):
+                print(f"找到复杂的验证集文件: {val_json_path}")
+                with open(val_json_path, 'r') as f:
+                    self.val_data = json.load(f)
+                self.data_type = "reason_seg_explanatory"
+            else:
+                raise FileNotFoundError(f"未找到指定的复杂验证集文件: {val_json_path}")
+        else:
+            raise ValueError("验证集配置不正确。请使用类似 'ReasonSeg|val' 的格式，并确保对应的 .../explanatory/val.json 文件存在。")
+        # ==================== 修改结束 ====================
 
     def __len__(self):
-        return len(self.data_list)
+        return len(self.val_data)
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize pixel values and pad to a square input."""
@@ -196,84 +201,52 @@ class ValDataset(torch.utils.data.Dataset):
         return x
 
     def __getitem__(self, idx):
-        # 修复：使用 while True 循环来确保总能返回一个有效样本
         while True:
             try:
-                if self.data_type == "refer_seg":
-                    image_info = self.data_list[idx]
-                    image_path = image_info["file_name"]
-                    if not os.path.exists(image_path):
-                         image_path = os.path.join(self.base_image_dir, "images/mscoco/images/train2014", image_info["file_name"].split("/")[-1])
-                    
-                    refs = self.refer_api.imgToRefs[image_info["id"]]
-                    sents = [sent['sent'] for ref in refs for sent in ref['sentences']]
-                    if not sents:
-                        # 如果没有句子，跳过此样本
-                        idx = random.randint(0, len(self.data_list) - 1)
-                        continue
+                # ==================== 修改开始 ====================
+                # 直接从加载的 val_data 中获取数据
+                item = self.val_data[idx]
+                image_name = item["image"]
+                json_name = item["json"]
+                
+                # 构建完整路径
+                # 假设图片和json文件在同一个val文件夹下
+                image_path = os.path.join(self.base_image_dir, "reason_seg", "ReasonSeg", "val", image_name)
+                json_path = os.path.join(self.base_image_dir, "reason_seg", "ReasonSeg", "val", json_name)
 
-                    full_prompt_text = "Please segment " + sents[0].strip().lower()
-                    
-                    ann_ids = [ref["ann_id"] for ref in refs]
-                    anns = self.refer_api.loadAnns(ann_ids=ann_ids[0])
-                    masks = [self.refer_api.getMask(ann)['mask'] for ann in anns]
-
-                else: # reason_seg (val)
-                    image_path = self.data_list[idx]
-                    json_path = image_path.replace(".jpg", ".json")
-
-                    if not os.path.exists(json_path):
-                        # 如果JSON不存在，跳过
-                        idx = random.randint(0, len(self.data_list) - 1)
-                        continue
-                    
-                    img_for_json = cv2.imread(image_path)
-                    if img_for_json is None:
-                        # 如果图片损坏，跳过
-                        idx = random.randint(0, len(self.data_list) - 1)
-                        continue
-
-                    mask_json, sents, is_sentence = get_mask_from_json(json_path, img_for_json)
-                    
-                    if not sents:
-                        # 如果没有句子，跳过
-                        idx = random.randint(0, len(self.data_list) - 1)
-                        continue
-
-                    full_prompt_text = sents[0].strip()
-                    if not is_sentence:
-                        full_prompt_text = f"What is {full_prompt_text} in this image? Please output segmentation mask."
-                    else:
-                        full_prompt_text = f"{full_prompt_text} Please output segmentation mask."
-                    masks = [mask_json]
-
-                # --- 统一的数据处理流程 ---
-                image_cv = cv2.imread(image_path)
-                if image_cv is None:
-                    idx = random.randint(0, len(self.data_list) - 1)
+                if not os.path.exists(image_path) or not os.path.exists(json_path):
+                    print(f"警告: 验证集文件缺失，跳过 {image_path} 或 {json_path}")
+                    idx = random.randint(0, len(self.data_list) - 1) # 随机换一个索引重试
                     continue
 
-                image_cv = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
+                # 从JSON获取query和output
+                full_prompt_text = item["query"]
+                answer_text = item["outputs"] # 这个答案用于构建对话，但在验证时模型会自己生成
+
+                # 从掩码JSON文件获取真实掩码
+                img_for_json = cv2.imread(image_path)
+                if img_for_json is None:
+                    idx = random.randint(0, len(self.data_list) - 1)
+                    continue
+                
+                masks, _, _ = get_mask_from_json(json_path, img_for_json)
+                masks = [masks] # 包装成列表
+
+                # --- 统一的数据处理流程 ---
+                image_cv = cv2.cvtColor(img_for_json, cv2.COLOR_BGR2RGB)
+                # ==================== 修改结束 ====================
                 
                 pil_image = Image.fromarray(image_cv)
-
                 image_for_sam = self.transform.apply_image(image_cv)
                 resize = image_for_sam.shape[:2]
                 image_for_sam_tensor = self.preprocess(torch.from_numpy(image_for_sam).permute(2, 0, 1).contiguous())
-                # ===================== 在这里添加调试代码 =====================
-                print(f"\n[DEBUG] Loading Val Sample: {image_path}")
-                print(f"[DEBUG]   - Loaded sents: {sents}")
-                print(f"[DEBUG]   - Generated prompt: {full_prompt_text}\n")
-                # =============================================================
-
-                # messages = [
-                #     {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": full_prompt_text}]},
-                #     {"role": "assistant", "content": ""} # 对于推理，将助手内容设置为空字符串
-                # ]
-                answer = random.choice(ANSWER_LIST) # e.g., "Sure, it is [SEG]."
+                
+                # 构建对话消息
+                # 注意：对于验证，助手的回答内容是空的，因为这是模型需要生成的部分。
+                # 但我们仍然需要完整的结构来应用模板。
                 messages = [
                     {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": full_prompt_text}]},
-                    {"role": "assistant", "content": answer} 
+                    {"role": "assistant", "content": ""} 
                 ]
 
                 final_masks = np.stack(masks, axis=0)
@@ -290,12 +263,12 @@ class ValDataset(torch.utils.data.Dataset):
                     label,
                     resize,
                     [full_prompt_text],
-                    sents,
+                    [], # sents 在这里可以为空，因为我们用的是完整的query
                     True, # inference=True
                 )
             
             except Exception as e:
-                # 捕获任何异常，打印错误，然后随机选择下一个样本重试
-                print(f"警告: 在处理验证集样本索引 {idx} (路径: {self.data_list[idx]}) 时发生错误: {e}。正在尝试下一个样本...")
-                idx = random.randint(0, len(self.data_list) - 1)
+                print(f"警告: 在处理验证集样本索引 {idx} 时发生错误: {e}。正在尝试下一个样本...")
+                idx = random.randint(0, len(self.val_data) - 1)
+
 

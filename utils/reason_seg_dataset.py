@@ -120,43 +120,48 @@ class ReasonSegDataset(torch.utils.data.Dataset):
         return x
 
     def __getitem__(self, idx):
-        # 循环直到找到一个有效的样本
         while True:
             try:
                 images, jsons = self.reason_seg_data
-                # 从数据集中随机选择一个索引
                 idx = random.randint(0, len(images) - 1)
                 image_path = jsons[idx].replace(".json", ".jpg")
                 json_path = jsons[idx]
+                
+                # 从图片路径中提取图片名，用于查询explanation
+                img_name = os.path.basename(image_path)
 
-                # 检查图像文件是否存在
+                # ==================== 修改开始 ====================
+                # 核心修改：检查这张图片是否存在于解释性数据中
+                if self.explanatory != -1 and img_name in self.img_to_explanation:
+                    # 如果存在，则直接使用解释性数据
+                    explanation_data = self.img_to_explanation[img_name]
+                    question = explanation_data["query"]
+                    answer = explanation_data["outputs"] # 假设JSON中也有答案字段，如果没有则需要调整
+                else:
+                    # 如果图片没有对应的复杂CoT数据，则跳过这个样本
+                    # print(f"警告: 样本 {img_name} 没有对应的解释性数据，跳过。")
+                    continue # 直接进入下一次循环，寻找下一个有效的样本
+                # ==================== 修改结束 ====================
+
                 if not os.path.exists(image_path):
-                    print(f"警告: 图像文件不存在于 {image_path}，跳过此样本。")
-                    # 继续下一次循环，尝试获取新样本
                     continue
-
                 image_cv = cv2.imread(image_path)
-                # 检查图像是否成功读取
                 if image_cv is None:
-                    print(f"警告: 无法读取或图像文件已损坏: {image_path}，跳过此样本。")
                     continue
                 
                 image_cv = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
                 ori_size = image_cv.shape[:2]
 
-                # --- SAM的图像预处理 ---
                 image_for_sam = self.transform.apply_image(image_cv)
                 resize = image_for_sam.shape[:2]
                 
-                # 从JSON获取掩码和句子
                 mask_from_json, sents, is_sentence = get_mask_from_json(json_path, image_cv)
                 
-                # 检查句子列表是否有效
                 if sents is None or len(sents) == 0:
-                    print(f"警告: 在 {json_path} 中未找到有效句子，跳过此样本。")
                     continue
 
-                # --- 数据采样 ---
+                # 注意：这里的 sents 仍然需要，因为我们需要它来确定要分割哪个mask
+                # 但 question 和 answer 已经从我们的CoT数据中获取了
                 if self.num_classes_per_sample < len(sents):
                     sampled_inds = np.random.choice(
                         list(range(len(sents))),
@@ -169,35 +174,20 @@ class ReasonSegDataset(torch.utils.data.Dataset):
                 sampled_sents = np.vectorize(sents.__getitem__)(sampled_inds).tolist()
                 sampled_masks = [mask_from_json for _ in sampled_inds]
 
-                # --- 准备Qwen的输入 ---
-                # 随机选择一个解说性问题或普通问题
-                if self.explanatory != -1 and random.random() < self.explanatory:
-                     # 确保解说性问题列表不为空
-                    if self.explanatory_question_list:
-                        question = random.choice(self.explanatory_question_list)
-                    else:
-                        # 如果为空，则退回使用普通问题
-                        question = random.choice(self.long_question_list).format(sent=sampled_sents[0])
-                else:
-                    question_template = random.choice(self.long_question_list)
-                    question = question_template.format(sent=sampled_sents[0])
-
-                # 准备结构化的对话消息
+                # 准备结构化的对话消息，这里的answer需要包含[SEG] token
+                # 我们假设CoT的答案也需要一个地方插入[SEG]
+                # 这里我们简单地在末尾添加，您可能需要根据需要调整
+                final_answer = answer + " [SEG]"
                 messages = [
                     {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": question}]},
-                    {"role": "assistant", "content": random.choice(self.answer_list)}
+                    {"role": "assistant", "content": final_answer}
                 ]
 
-                # --- 准备返回的张量 ---
                 image_for_sam_tensor = self.preprocess(torch.from_numpy(image_for_sam).permute(2, 0, 1).contiguous())
-
                 masks_tensor = torch.from_numpy(np.stack(sampled_masks, axis=0))
-                
                 label_tensor = torch.ones(masks_tensor.shape[1], masks_tensor.shape[2]) * self.ignore_label
-                
                 pil_image = Image.fromarray(image_cv)
                 
-                # 如果所有步骤都成功，则返回数据并跳出循环
                 return (
                     image_path,
                     image_for_sam_tensor,
@@ -206,14 +196,12 @@ class ReasonSegDataset(torch.utils.data.Dataset):
                     masks_tensor,
                     label_tensor,
                     resize,
-                    [question], # 保持questions_list的格式
+                    [question],
                     sampled_sents,
-                    False, # inference
+                    False,
                 )
 
             except Exception as e:
-                # 捕获任何异常，打印错误信息，然后继续下一次循环
                 print(f"在处理索引 {idx} (路径: {image_path}) 时发生错误: {e}，正在尝试下一个样本...")
-                # 等待一小段时间，避免在连续错误时刷屏
                 import time
                 time.sleep(0.1)

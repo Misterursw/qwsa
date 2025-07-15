@@ -38,7 +38,7 @@ def parse_args(args):
     parser.add_argument("--version", default="Qwen/Qwen2.5-VL-3B-Instruct", type=str)
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument("--precision", default="bf16", type=str, choices=["fp32", "bf16", "fp16"], help="precision for inference")
-    parser.add_argument("--image_size", default=1024, type=int, help="image size")
+    parser.add_argument("--image_size", default=256, type=int, help="image size")
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument("--vision-tower", default="openai/clip-vit-large-patch14", type=str)
@@ -125,9 +125,41 @@ def main(args):
         args.version, cache_dir=None, model_max_length=args.model_max_length, padding_side="right",
         use_fast=False, trust_remote_code=True, local_files_only=True)
     tokenizer.pad_token = tokenizer.eos_token 
-    tokenizer.add_tokens("[SEG]")
+    # ==================== 修改开始 ====================
+    # 定义所有你需要的特殊token
+    # 我们不仅需要[SEG]，还需要<think>, </think>, <answer>, </answer>
+    new_special_tokens = {
+        "additional_special_tokens": [
+            "[SEG]", 
+            "<think>", 
+            "</think>", 
+            "<answer>", 
+            "</answer>"
+        ]
+    }
+
+    # 将新token添加到分词器中
+    num_added_tokens = tokenizer.add_special_tokens(new_special_tokens)
+
+    if num_added_tokens > 0:
+        # 如果成功添加了新token，必须调整模型词嵌入层的大小以匹配
+        model.resize_token_embeddings(len(tokenizer))
+        
+        # 初始化新token的词向量（非常重要！）
+        # 你可以简单地使用现有词向量的平均值来初始化它们
+        with torch.no_grad():
+            input_embeds = model.get_input_embeddings().weight.data
+            output_embeds = model.get_output_embeddings().weight.data
+            
+            avg_embed = input_embeds[:-num_added_tokens].mean(dim=0, keepdim=True)
+            input_embeds[-num_added_tokens:] = avg_embed
+            output_embeds[-num_added_tokens:] = avg_embed
+
+    # 找到 [SEG] token的ID并保存，这部分逻辑保持不变
     args.seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
     model.seg_token_idx = args.seg_token_idx
+
+    # ==================== 修改结束 ====================
     processor = transformers.AutoProcessor.from_pretrained(
         args.version, trust_remote_code=True, use_fast=True, local_files_only=True)
     logging.info("Tokenizer 和 Processor 加载完毕。")

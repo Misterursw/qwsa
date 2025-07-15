@@ -17,9 +17,9 @@ LOG_DIR="/home/ubuntu/LISA-main/log"
 
 
 # --- 3. 训练参数设置 ---
-MODEL_PATH="/data/lzl/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3"
+MODEL_PATH="/home/ubuntu/.cache/modelscope/hub/models/mlx-community/Qwen2.5VL-3B-VLM-R1"
 DATASET_DIR="/home/ubuntu/liuzelin/dataset"
-VISION_PRETRAINED="/home/ubuntu/LISA-main/sam_vit_h_4b8939.pth"
+VISION_PRETRAINED="/data/lzl/ckpt/medsam_vit_b.pth"
 EXP_NAME="qwsa-3b"
 
 # --- 4. Conda 环境配置 ---

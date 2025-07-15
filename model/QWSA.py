@@ -2,7 +2,7 @@
 import os
 from typing import List
 import logging # ### MODIFICATION START ###
-
+from model.segment_anything import build_sam_vit_b # 确保导入
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,7 +30,8 @@ class QWSAForCausalLM(Qwen2_5_VLForConditionalGeneration):
             config.image_grid_pinpoints = [[448, 448]]
 
         # 1. 构建SAM视觉模型
-        self.visual_model = build_sam_vit_h()
+        
+        self.visual_model = build_sam_vit_b()
 
         # 2. 加载预训练SAM权重
         vision_pretrained = kwargs.pop("vision_pretrained", None)

@@ -396,9 +396,15 @@ conv_llava_v1_mmtag = Conversation(
     sep2="</s>",
     version="v1_mmtag",
 )
-
+NEW_SYSTEM_PROMPT = (
+    "You are an expert visual assistant. Your task is to respond to user queries about an image. "
+    "You must follow a strict format. First, provide a step-by-step reasoning process enclosed in <think></think> tags. "
+    "Second, provide a concise final answer enclosed in <answer></answer> tags. "
+    "The answer must contain the special token [SEG] to trigger the segmentation based on your reasoning."
+)
 conv_qwen = Conversation(
-    system="You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
+    # 将原来的 system prompt 替换为您的新版本
+    system=NEW_SYSTEM_PROMPT,
     roles=("user", "assistant"),
     version="qwen",
     messages=[],
