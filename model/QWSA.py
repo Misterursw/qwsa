@@ -1,8 +1,8 @@
-# 文件路径: model/QWSA.py
+# file: model/QWSA.py
+
 import os
-from typing import List
-import logging # ### MODIFICATION START ###
-from model.segment_anything import build_sam_vit_b # 确保导入
+from typing import List, Optional, Tuple
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +10,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration
 from model.segment_anything import build_sam_vit_b
 from model.segment_anything.utils.transforms import ResizeLongestSide
 
+# --- 辅助函数 (dice_loss, sigmoid_ce_loss, preprocess_image_for_sam) 保持不变 ---
 def dice_loss(inputs: torch.Tensor, targets: torch.Tensor, num_masks: float, scale=1000, eps=1e-6):
     inputs = inputs.sigmoid().flatten(1, 2)
     targets = targets.flatten(1, 2)
@@ -21,187 +22,174 @@ def dice_loss(inputs: torch.Tensor, targets: torch.Tensor, num_masks: float, sca
 def sigmoid_ce_loss(inputs: torch.Tensor, targets: torch.Tensor, num_masks: float):
     loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
     return loss.flatten(1, 2).mean(1).sum() / (num_masks + 1e-8)
+
 def preprocess_image_for_sam(image: torch.Tensor, image_size: int = 1024) -> torch.Tensor:
-    """
-    为SAM模型预处理图像：调整大小、归一化、填充。
-    假设输入为 [batch_size, channels, height, width] 的张量。
-    """
-    # 反归一化 pixel_values 到 [0, 255]
-    image = image * torch.tensor([0.26862954, 0.26130258, 0.27577711], device=image.device).view(1, -1, 1, 1) + \
-            torch.tensor([0.48145466, 0.4578275, 0.40821073], device=image.device).view(1, -1, 1, 1)
-    image = image * 255  # 恢复到 [0, 255]
-    
-    pixel_mean = torch.tensor([0.48145466 * 255, 0.4578275 * 255, 0.40821073 * 255], device=image.device).view(-1, 1, 1)
-    pixel_std = torch.tensor([0.26862954 * 255, 0.26130258 * 255, 0.27577711 * 255], device=image.device).view(-1, 1, 1)
-    
+    # 假设输入是 [B, C, H, W] 且在 [0, 1] 区间
+    pixel_mean = torch.tensor([123.675, 116.28, 103.53], device=image.device).view(1, -1, 1, 1)
+    pixel_std = torch.tensor([58.395, 57.12, 57.375], device=image.device).view(1, -1, 1, 1)
+    image = image * 255.0
     transform = ResizeLongestSide(image_size)
-    batch_size = image.shape[0]
     image_sam_list = []
-    
-    for i in range(batch_size):
-        img_np = image[i].permute(1, 2, 0).cpu().numpy()  # [C, H, W] -> [H, W, C]
-        img_resized = transform.apply_image(img_np)  # 调整大小
-        img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).to(image.device)  # [H, W, C] -> [C, H, W]
+    for i in range(image.shape[0]):
+        img_np = image[i].permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        img_resized = transform.apply_image(img_np)
+        img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).to(image.device)
         image_sam_list.append(img_tensor)
-    
-    image_sam = torch.stack(image_sam_list, dim=0)  # [batch_size, C, H, W]
-    image_sam = (image_sam - pixel_mean) / pixel_std  # 归一化
-    
-    # 填充为方形
+    image_sam = torch.stack(image_sam_list, dim=0).float()
+    image_sam = (image_sam - pixel_mean) / pixel_std
     _, _, h, w = image_sam.shape
     padh = image_size - h
     padw = image_size - w
     image_sam = F.pad(image_sam, (0, padw, 0, padh))
-    
     return image_sam
+
 
 class QWSAForCausalLM(Qwen2_5_VLForConditionalGeneration):
     def __init__(self, config, **kwargs):
         super().__init__(config)
         
-        if not hasattr(config, "image_grid_pinpoints") or config.image_grid_pinpoints is None:
-            config.image_grid_pinpoints = [[448, 448]]
+        # 从kwargs获取必要的参数
+        self.seg_token_idx = kwargs.get("seg_token_idx", tokenizer.convert_tokens_to_ids("<|extra_0|>"))
+        self.image_size = kwargs.get("image_size", 1024)  # 默认图像大小
+        self.ce_loss_weight = kwargs.get("ce_loss_weight", 1.0)  # 交叉熵损失权重
+        self.dice_loss_weight = kwargs.get("dice_loss_weight", 0.5)  # Dice损失权重
+        self.bce_loss_weight = kwargs.get("bce_loss_weight", 2.0)  # BCE损失权重
 
+        # 初始化 SAM 模型
         self.visual_model = build_sam_vit_b()
-        vision_pretrained = kwargs.pop("vision_pretrained", None)
+        vision_pretrained = kwargs.get("vision_pretrained")
         if vision_pretrained and os.path.exists(vision_pretrained):
             sam_checkpoint = torch.load(vision_pretrained, map_location="cpu")
-            # 使用 assign=True 强制赋值 meta 参数
-            self.visual_model.load_state_dict(sam_checkpoint, strict=False, assign=True)
-            logging.info("SAM 权重加载完成")
-            logging.info(f"SAM pos_embed 示例值: {self.visual_model.image_encoder.pos_embed[:5]}")
+            self.visual_model.load_state_dict(sam_checkpoint, strict=False)
+            logging.info("SAM weights loaded successfully.")
         
-        for param in self.visual_model.parameters():
+        # 冻结 SAM 图像编码器的参数
+        for param in self.visual_model.image_encoder.parameters():
             param.requires_grad = False
-        if kwargs.get("train_mask_decoder", False):
+        
+        # 默认情况下，mask_decoder的参数是可训练的
+        if kwargs.get("train_mask_decoder", True):
             self.visual_model.mask_decoder.train()
             for param in self.visual_model.mask_decoder.parameters():
                 param.requires_grad = True
 
+        # 文本嵌入投影层
         in_dim = config.hidden_size
         out_dim = kwargs.get("out_dim", 256)
-        text_fc = [
-            nn.Linear(in_dim, in_dim), nn.ReLU(inplace=True),
-            nn.Linear(in_dim, out_dim), nn.Dropout(0.0),
-        ]
-        self.text_hidden_fcs = nn.ModuleList([nn.Sequential(*text_fc)])
+        self.text_hidden_fcs = nn.ModuleList([  # 文字嵌入投影层
+            nn.Sequential(
+                nn.Linear(in_dim, in_dim), nn.ReLU(inplace=True),
+                nn.Linear(in_dim, out_dim), nn.Dropout(0.0)
+            )
+        ])
         self.text_hidden_fcs.train()
         for param in self.text_hidden_fcs.parameters():
             param.requires_grad = True
 
-        self.seg_token_idx = kwargs.pop("seg_token_idx", -1)
-        self.ce_loss_weight = kwargs.pop("ce_loss_weight", 1.0)
-        self.dice_loss_weight = kwargs.pop("dice_loss_weight", 0.5)
-        self.bce_loss_weight = kwargs.pop("bce_loss_weight", 2.0)
-        self.image_size = kwargs.pop("image_size", 1024)
-    def get_visual_embs(self, pixel_values: torch.FloatTensor):
-            with torch.no_grad():
-                image_embeddings = self.visual_model.image_encoder(pixel_values)
-            return image_embeddings
+    @torch.no_grad()
+    def get_sam_image_embeddings(self, images_for_sam: torch.Tensor):
+        """
+        使用 SAM 图像编码器获取图像的嵌入。
+        """
+        sam_input_images = preprocess_image_for_sam(images_for_sam, self.image_size).to(self.dtype)
+        return self.visual_model.image_encoder(sam_input_images)
+
     def forward(self, **kwargs):
-        model_kwargs = {k: v for k, v in kwargs.items() if k in [
-            "pixel_values", "input_ids", "labels", "attention_mask", "image_grid_thw"
-        ]}
-        
-        pixel_values = kwargs.get('pixel_values')
-        logging.info(f"pixel_values in forward形状: {pixel_values.shape}")
-        logging.info(f"pixel_values in forward范围: min={pixel_values.min()}, max={pixel_values.max()}")
-        if pixel_values is None:
-            raise ValueError("Expected 'pixel_values' in kwargs for image processing")
-        
-        # 调试：检查 pixel_values 范围和形状
+        """
+        前向传播逻辑。
+        处理文本生成和掩码预测。
+        """
+        # 如果是推理模式，直接调用父类方法，不做任何修改
         if not self.training:
-            logging.info(f"pixel_values 形状: {pixel_values.shape}")
-            logging.info(f"pixel_values 范围: min={pixel_values.min()}, max={pixel_values.max()}")
+            return super().forward(**kwargs)
+
+        # --- 以下是训练模式的逻辑 ---
         
-        images = preprocess_image_for_sam(pixel_values, self.image_size).to(pixel_values.dtype)
-        logging.info(f"SAM images 形状: {images.shape}")
-        logging.info(f"SAM images 范围: min={images.min()}, max={images.max()}")        
-        # 调试：比较 Qwen2.5-VL 和 SAM 的图像嵌入
-        if not self.training:
-            qwen_visual_emb = self.visual(pixel_values)
-            sam_visual_emb = self.get_visual_embs(images)
-            logging.info(f"Qwen visual embedding norm: {qwen_visual_emb.norm()}")
-            logging.info(f"SAM visual embedding norm: {sam_visual_emb.norm()}")
+        # 从kwargs中分离出自定义的参数
+        images_for_sam = kwargs.pop('images')
+        masks_list = kwargs.pop('masks_list')
+        label_list = kwargs.pop('label_list')
+        resize_list = kwargs.pop('resize_list')
+        kwargs.pop('offset', None)
+
+        # 1. 获取语言模型的损失和隐藏状态
+        kwargs['output_hidden_states'] = True
+        outputs = super().forward(**kwargs)
+        ce_loss = outputs.loss
         
-        offset = kwargs.get('offset', [0])
-        resize_list = kwargs.get('resize_list', [(images.shape[-2], images.shape[-1])] * images.shape[0])
-        
-        model_kwargs['output_hidden_states'] = True
-        outputs = super().forward(**model_kwargs)
+        # 2. 获取[SEG]标记的掩码
         hidden_states = outputs.hidden_states[-1]
-        input_ids = model_kwargs.get("input_ids")
-
+        input_ids = kwargs["input_ids"]
         seg_token_mask = (input_ids == self.seg_token_idx)
-        if not self.training:
-            logging.info(f"[QWSA.forward-DEBUG] Is training: {self.training}")
-            logging.info(f"[QWSA.forward-DEBUG] seg_token_idx: {self.seg_token_idx}")
-            logging.info(f"[QWSA.forward-DEBUG] input_ids shape: {input_ids.shape}")
-            logging.info(f"[QWSA.forward-DEBUG] Number of SEG tokens found: {torch.sum(seg_token_mask)}")
 
+        # 如果需要调整掩码尺寸
         if hidden_states.shape[1] > seg_token_mask.shape[1]:
-            diff = hidden_states.shape[1] - seg_token_mask.shape[1]
-            padding = torch.zeros((seg_token_mask.shape[0], diff), dtype=torch.bool, device=seg_token_mask.device)
-            seg_token_mask = torch.cat([padding, seg_token_mask], dim=1)
-        
-        pred_embeddings = self.text_hidden_fcs[0](hidden_states[seg_token_mask])
+            seg_token_mask = F.pad(seg_token_mask, (0, hidden_states.shape[1] - seg_token_mask.shape[1]))
 
-        if not self.training:
-            logging.info(f"[QWSA.forward-DEBUG] pred_embeddings shape: {pred_embeddings.shape}")
+        # 提取并投影 [SEG] 嵌入
+        pred_text_embeddings = self.text_hidden_fcs[0](hidden_states[seg_token_mask])
 
+        # 3. 获取 SAM 图像嵌入
+        sam_image_embeds = self.get_sam_image_embeddings(images_for_sam)
+
+        # 使用投影后的文本嵌入和 SAM 图像嵌入来预测掩码
+        pred_masks = []
         seg_token_counts = seg_token_mask.int().sum(-1)
         seg_token_offset = torch.cat([torch.zeros(1, device=seg_token_counts.device).long(), seg_token_counts.cumsum(-1)])
-        seg_token_offset = seg_token_offset[offset]
 
-        pred_embeddings_ = []
+        # 处理每个分割标记生成掩码
         for i in range(len(seg_token_offset) - 1):
-            start_i, end_i = seg_token_offset[i], seg_token_offset[i+1]
-            pred_embeddings_.append(pred_embeddings[start_i:end_i])
-        pred_embeddings = pred_embeddings_
-        logging.info(f"[SEG] token 嵌入范数: {pred_embeddings.norm(dim=-1)}")
-        image_embeddings_sam = self.get_visual_embs(images)
-        pred_masks = []
-        for i in range(len(pred_embeddings)):
-            if pred_embeddings[i].shape[0] == 0: continue
+            start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
+            if start_i >= end_i: continue
+
+            current_text_embeds = pred_text_embeddings[start_i:end_i]
+            
+            # 使用 prompt_encoder 获取稀疏和稠密嵌入
             sparse_embeddings, dense_embeddings = self.visual_model.prompt_encoder(
-                points=None, boxes=None, masks=None, text_embeds=pred_embeddings[i].unsqueeze(1),
+                points=None, boxes=None, masks=None, text_embeds=current_text_embeds.unsqueeze(1)
             )
-            sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
+            sparse_embeddings = sparse_embeddings.to(current_text_embeds.dtype)
+
+            # 使用 mask_decoder 获取分割掩码
             low_res_masks, _ = self.visual_model.mask_decoder(
-                image_embeddings=image_embeddings_sam[i].unsqueeze(0),
+                image_embeddings=sam_image_embeds[i].unsqueeze(0),
                 image_pe=self.visual_model.prompt_encoder.get_dense_pe(),
                 sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings, multimask_output=False,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=False,
             )
-            original_size = kwargs.get('label_list', [(images.shape[-2], images.shape[-1])] * len(pred_embeddings))[i]
+
             pred_mask = self.visual_model.postprocess_masks(
-                low_res_masks, input_size=resize_list[i], original_size=original_size,
+                low_res_masks,
+                input_size=resize_list[i],
+                original_size=label_list[i],
             )
             pred_masks.append(pred_mask[:, 0])
 
-        if self.training:
-            ce_loss = outputs.loss * self.ce_loss_weight
-            device = ce_loss.device
-            mask_bce_loss = torch.tensor(0.0, device=device)
-            mask_dice_loss = torch.tensor(0.0, device=device)
-            num_masks = 0
+        # 计算掩码损失
+        mask_bce_loss = torch.tensor(0.0, device=ce_loss.device)
+        mask_dice_loss = torch.tensor(0.0, device=ce_loss.device)
+        num_valid_masks = 0
+        
+        for i, pred_mask_item in enumerate(pred_masks):
+            gt_mask = masks_list[i]
+            if gt_mask.numel() == 0 or pred_mask_item.numel() == 0:
+                continue
             
-            masks_list = kwargs.get('masks_list', [])
-            for batch_idx in range(len(pred_masks)):
-                gt_mask = masks_list[batch_idx] if masks_list else torch.zeros_like(pred_masks[batch_idx])
-                if gt_mask.shape[0] == 0: continue
-                num_masks += gt_mask.shape[0]
-                mask_bce_loss += (sigmoid_ce_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0]) * gt_mask.shape[0])
-                mask_dice_loss += (dice_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0]) * gt_mask.shape[0])
+            # 确保预测和GT的mask数量匹配
+            if pred_mask_item.shape[0] != gt_mask.shape[0]:
+                logging.warning(f"Batch {i} mask mismatch: pred {pred_mask_item.shape[0]}, gt {gt_mask.shape[0]}")
+                continue
 
-            mask_bce_loss = self.bce_loss_weight * mask_bce_loss / (num_masks + 1e-8)
-            mask_dice_loss = self.dice_loss_weight * mask_dice_loss / (num_masks + 1e-8)
-            mask_loss = mask_bce_loss + mask_dice_loss
+            num_valid_masks += pred_mask_item.shape[0]
+            mask_bce_loss += sigmoid_ce_loss(pred_mask_item, gt_mask, num_masks=1) * pred_mask_item.shape[0]
+            mask_dice_loss += dice_loss(pred_mask_item, gt_mask, num_masks=1) * pred_mask_item.shape[0]
 
-            return {
-                "loss": ce_loss + mask_loss, "ce_loss": ce_loss,
-                "mask_bce_loss": mask_bce_loss, "mask_dice_loss": mask_dice_loss, "mask_loss": mask_loss,
-                "pred_masks_train": pred_masks, "gt_masks_train": masks_list
-            }
-        else:
-            return {"pred_masks": pred_masks}
+        mask_bce_loss = self.bce_loss_weight * mask_bce_loss / (num_valid_masks + 1e-8)
+        mask_dice_loss = self.dice_loss_weight * mask_dice_loss / (num_valid_masks + 1e-8)
+        mask_loss = mask_bce_loss + mask_dice_loss
+
+        # 总损失
+        total_loss = self.ce_loss_weight * ce_loss + mask_loss
+        
+        return {"loss": total_loss, "ce_loss": ce_loss, "mask_loss": mask_loss}
