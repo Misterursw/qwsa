@@ -10,6 +10,7 @@ DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_IMAGE_PATCH_TOKEN = "<im_patch>"
 DEFAULT_IM_START_TOKEN = "<im_start>"
 DEFAULT_IM_END_TOKEN = "<im_end>"
+SEG_TOKEN = "<seg_mask>"
 
 SHORT_QUESTION_LIST = [
     DEFAULT_IMAGE_TOKEN + "\n" + "Can you segment the {class_name} in this image?",
@@ -34,11 +35,11 @@ EXPLANATORY_QUESTION_LIST = [
 ]
 
 ANSWER_LIST = [
-    "It is [SEG].",
-    "Sure, [SEG].",
-    "Sure, it is [SEG].",
-    "Sure, the segmentation result is [SEG].",
-    "[SEG].",
+    "It is {SEG_TOKEN}.",
+    "Sure, {SEG_TOKEN}.",
+    "Sure, it is {SEG_TOKEN}.",
+    "Sure, the segmentation result is {SEG_TOKEN}.",
+    "{SEG_TOKEN}.",
 ]
 
 

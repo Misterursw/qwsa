@@ -24,23 +24,74 @@ def sigmoid_ce_loss(inputs: torch.Tensor, targets: torch.Tensor, num_masks: floa
     return loss.flatten(1, 2).mean(1).sum() / (num_masks + 1e-8)
 
 def preprocess_image_for_sam(image: torch.Tensor, image_size: int = 1024) -> torch.Tensor:
-    # 假设输入是 [B, C, H, W] 且在 [0, 1] 区间
+    """
+    预处理图像用于SAM模型
+    Args:
+        image: 输入图像张量，可能的形状：
+               - [B, C, H, W]: 批量图像
+               - [C, H, W]: 单张图像
+               - [B, 1, C, H, W]: Qwen格式的图像
+        image_size: SAM期望的图像尺寸
+    Returns:
+        处理后的图像张量 [B, C, H, W]
+    """
+    # 打印调试信息
+    print(f"Original image shape: {image.shape}")
+    
+    # 处理不同的输入形状
+    if image.dim() == 5:  # [B, 1, C, H, W] -> [B, C, H, W]
+        image = image.squeeze(1)
+    elif image.dim() == 3:  # [C, H, W] -> [1, C, H, W]
+        image = image.unsqueeze(0)
+    elif image.dim() == 1:
+        raise ValueError(f"输入图像维度错误: {image.shape}. 期望至少3维 [C, H, W]")
+    
+    # 确保图像是4维 [B, C, H, W]
+    if image.dim() != 4:
+        raise ValueError(f"处理后图像维度错误: {image.shape}. 期望4维 [B, C, H, W]")
+    
+    print(f"Processed image shape: {image.shape}")
+    
+    # SAM的标准化参数
     pixel_mean = torch.tensor([123.675, 116.28, 103.53], device=image.device).view(1, -1, 1, 1)
     pixel_std = torch.tensor([58.395, 57.12, 57.375], device=image.device).view(1, -1, 1, 1)
-    image = image * 255.0
+    
+    # 如果图像在[0,1]范围，转换到[0,255]
+    if image.max() <= 1.0:
+        image = image * 255.0
+    
+    # 导入ResizeLongestSide（确保已导入）
+    from segment_anything.utils.transforms import ResizeLongestSide
     transform = ResizeLongestSide(image_size)
+    
     image_sam_list = []
     for i in range(image.shape[0]):
-        img_np = image[i].permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        # 获取单张图像 [C, H, W]
+        single_image = image[i]
+        
+        # 转换为numpy格式 [H, W, C]
+        img_np = single_image.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        
+        # 使用SAM的resize变换
         img_resized = transform.apply_image(img_np)
+        
+        # 转回tensor格式 [C, H, W]
         img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).to(image.device)
         image_sam_list.append(img_tensor)
+    
+    # 堆叠成批量 [B, C, H, W]
     image_sam = torch.stack(image_sam_list, dim=0).float()
+    
+    # SAM标准化
     image_sam = (image_sam - pixel_mean) / pixel_std
+    
+    # 填充到指定尺寸
     _, _, h, w = image_sam.shape
     padh = image_size - h
     padw = image_size - w
     image_sam = F.pad(image_sam, (0, padw, 0, padh))
+    
+    print(f"Final SAM image shape: {image_sam.shape}")
     return image_sam
 
 
@@ -49,7 +100,10 @@ class QWSAForCausalLM(Qwen2_5_VLForConditionalGeneration):
         super().__init__(config)
         
         # 从kwargs获取必要的参数
-        self.seg_token_idx = kwargs.get("seg_token_idx", tokenizer.convert_tokens_to_ids("<|extra_0|>"))
+        self.seg_token_idx = kwargs.get("seg_token_idx", None)
+        if self.seg_token_idx is None:
+            # 可以设置一个合理的默认值，或者抛出错误提示必须传入
+            raise ValueError("seg_token_idx must be provided during model initialization")
         self.image_size = kwargs.get("image_size", 1024)  # 默认图像大小
         self.ce_loss_weight = kwargs.get("ce_loss_weight", 1.0)  # 交叉熵损失权重
         self.dice_loss_weight = kwargs.get("dice_loss_weight", 0.5)  # Dice损失权重

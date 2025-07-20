@@ -1,33 +1,53 @@
-# file: test.py
-
 import argparse
 import os
+import re
 import sys
 from PIL import Image
 import cv2
 import torch
-import numpy as np
+from typing import List
+import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoProcessor
 from model.QWSA import QWSAForCausalLM
-from torchvision.transforms import ToTensor
+from model.segment_anything.utils.transforms import ResizeLongestSide
 import logging
-import warnings
-
-# 忽略所有 UserWarning
-warnings.filterwarnings("ignore", category=UserWarning)
-
-# --- 日志配置 ---
+import numpy as np
+import sys
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     stream=sys.stdout
 )
+import argparse
+import os
+import re
+import sys
+from PIL import Image
+import cv2
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoProcessor
+from model.QWSA import QWSAForCausalLM
+from model.segment_anything.utils.transforms import ResizeLongestSide
+import logging
+from transformers.generation.utils import StoppingCriteria
+from typing import List
+from transformers import StoppingCriteriaList
+class StopOnTokens(StoppingCriteria):
+    def __init__(self, stop_token_ids: List[List[int]]):
+        self.stop_token_ids = stop_token_ids
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        for stop_ids in self.stop_token_ids:
+            if len(input_ids[0]) >= len(stop_ids):
+                if torch.equal(input_ids[0][-len(stop_ids):], torch.tensor(stop_ids, device=input_ids.device)):
+                    return True
+        return False
 
 def inference(model: QWSAForCausalLM, tokenizer, processor, image_path: str, prompt: str, args):
     """
-    执行解耦后的三步推理：1. 文本生成, 2. 特征提取, 3. 掩码预测
+    执行推理：文本生成、特征提取和掩码预测。
     """
-    # --- 步骤 1: 加载图像并准备Qwen输入 ---
     logging.info(f"加载图像: {image_path}")
     image_cv = cv2.imread(image_path)
     if image_cv is None:
@@ -37,177 +57,122 @@ def inference(model: QWSAForCausalLM, tokenizer, processor, image_path: str, pro
     image_cv_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
     pil_image = Image.fromarray(image_cv_rgb)
     
-    # 直接使用processor，它会自动处理图像占位符
     conversation = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": prompt}
-            ],
-        }
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]},
+        {"role": "assistant", "content": ""}
     ]
     
-    # 应用chat模板
     text = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+    qwen_inputs = processor(text=[text], images=[pil_image], return_tensors="pt", padding=True).to(model.device)
     
-    # 处理输入
-    qwen_inputs = processor(
-        text=[text],
-        images=[pil_image],
-        return_tensors="pt",
-        padding=True
-    ).to(model.device)
-    
-    # 确保数据类型正确
     if 'pixel_values' in qwen_inputs:
         qwen_inputs['pixel_values'] = qwen_inputs['pixel_values'].to(model.dtype)
+        # 添加调试信息
+        logging.info(f"Qwen pixel_values shape: {qwen_inputs['pixel_values'].shape}")
     
-# --- 步骤 2: 生成文本和隐藏状态 ---
-    logging.info("模型正在生成文本和 CoT...")
+    logging.info("模型正在生成文本...")
+    
+    stop_strings = ["</answer>", "<|im_end|>"]
+    stop_token_ids = [tokenizer.encode(s, add_special_tokens=False) for s in stop_strings if s]
+    stopping_criteria = StoppingCriteriaList([StopOnTokens(stop_token_ids)])
+    
     with torch.no_grad():
-        # 添加停止词（保持原样，因为 <answer> 等非特殊 token）
-        stop_strings = ["</answer>", "<|im_end|>"]
-        stopping_criteria = []
-        # 如果 tokenizer 支持停止词
-        if hasattr(tokenizer, "encode"):
-            stopping_criteria = []
-            for stop_str in stop_strings:
-                stop_ids = tokenizer.encode(stop_str, add_special_tokens=False)
-                if stop_ids:
-                    from transformers import StoppingCriteria, StoppingCriteriaList
-                    
-                    class StopOnTokens(StoppingCriteria):
-                        def __init__(self, stop_id_seq: List[int]):
-                            self.stop_id_seq = stop_id_seq
-                        
-                        def __call__(self, input_ids, scores, **kwargs):
-                            if len(self.stop_id_seq) > 0 and input_ids[0][-len(self.stop_id_seq):].tolist() == self.stop_id_seq:
-                                return True
-                            return False
-                    
-                    stopping_criteria.append(StopOnTokens(stop_ids))  # 直接传 stop_ids (list[int])
-        
         generate_outputs = model.generate(
             **qwen_inputs,
             max_new_tokens=args.model_max_length,
-            do_sample=True,
-            top_p=0.9,
-            temperature=0.7,
-            output_hidden_states=True,
-            return_dict_in_generate=True,
-            use_cache=True,
-            stopping_criteria=StoppingCriteriaList(stopping_criteria) if stopping_criteria else None,  # 添加条件，避免空列表
+            do_sample=True, top_p=0.9, temperature=0.7,
+            output_hidden_states=True, return_dict_in_generate=True,
+            use_cache=True, stopping_criteria=stopping_criteria,
+            pad_token_id=tokenizer.eos_token_id,
         )
+
     if generate_outputs.hidden_states is None:
-        logging.error("模型未返回 hidden_states。请确认 config 或 generate() 的参数。")
-    logging.info(f"Hidden states length: {len(generate_outputs.hidden_states)}")
-    # 解码文本
+        logging.error("模型未返回 hidden_states。")
+        return None, "错误：模型未能获取隐藏状态。"
+
     output_ids = generate_outputs.sequences[0]
-    assistant_response = tokenizer.decode(output_ids[qwen_inputs['input_ids'].shape[1]:], skip_special_tokens=False).strip()
-    
-    # 新增：替换 <|extra_0|> 为 "[SEG]" 以显示直观（其他标签不变）
-    seg_token_str = "<|extra_0|>"  # 对应 [SEG] 的 extra token
-    assistant_response = assistant_response.replace(seg_token_str, "[SEG]")
-    
-    logging.info(f"模型生成回答 (包含特殊tokens):\n{assistant_response}")
-    if "<answer>" in assistant_response and "</answer>" not in assistant_response:
-        # 找到 [SEG] 或文本结束的位置（用显示字符串检查）
-        if "[SEG]" in assistant_response:
-            assistant_response = assistant_response.replace("[SEG]", "</answer>\n[SEG]")
-        else:
-            assistant_response += "\n</answer>"
-    # 调试：打印生成的 token IDs
     generated_sequence = output_ids[qwen_inputs['input_ids'].shape[1]:]
-    logging.info(f"Generated token IDs: {generated_sequence.tolist()}")
+    assistant_response = tokenizer.decode(generated_sequence, skip_special_tokens=False).strip()
     
-    # 调试：解码每个 token
+    logging.info(f"模型生成回答 (完整解码):\n{assistant_response}")
+
+    # ==================== 详细解码打印 ====================
+    logging.info("------ 开始逐个Token解码分析 ------")
     for i, token_id in enumerate(generated_sequence):
-        token = tokenizer.decode([token_id], skip_special_tokens=False)
-        logging.info(f"Token {i}: ID={token_id}, Text='{token}'")
-    
-    # --- 步骤 3: 提取[SEG]嵌入并预测掩码 ---
+        token_text = tokenizer.decode([token_id])
+        logging.info(f"Token {i}: ID={token_id.item():<6} -> Decoded: '{token_text}'")
+    logging.info("------ 逐个Token解码分析结束 ------")
+    # ==========================================================
+
     predicted_mask = None
-    seg_token_id = model.seg_token_idx  # 已设置为 <|extra_0|> 的 ID
-    logging.info(f"Looking for SEG token with ID: {seg_token_id}")
     
-    seg_token_mask = (generated_sequence == seg_token_id)
-    logging.info(f"SEG token mask: {seg_token_mask}")
-    logging.info(f"Number of SEG tokens found: {seg_token_mask.sum().item()}")
+    # 寻找分割触发信号的代码保持不变
+    SEG_TRIGGER_WORD = "seg"
+    seg_word_id = tokenizer.convert_tokens_to_ids(SEG_TRIGGER_WORD)
     
-    # 如果找不到 [SEG] token，尝试通过文本查找（用显示字符串）
-    if not torch.any(seg_token_mask):
-        if "[SEG]" in assistant_response:
-            logging.warning("[SEG] found in text but not as a single token. Tokenizer may be splitting it.")
-            # 尝试重新 tokenize 来找到正确的位置
-            # 注意：这里用替换后的 assistant_response，但实际 token 是 extra，所以如果替换正确，此处应已匹配 seg_token_id
-            temp_tokens = tokenizer(assistant_response, return_tensors="pt")['input_ids'][0]
-            logging.info(f"Re-tokenized response: {temp_tokens.tolist()}")
-    logging.info(f"Input shape: {qwen_inputs['input_ids'].shape}")
-    if torch.any(seg_token_mask):
-        logging.info("检测到 [SEG] token, 开始预测掩码...")
+    logging.info(f"正在寻找触发词 '{SEG_TRIGGER_WORD}', ID: {seg_word_id}")
+    
+    seg_indices = torch.where(generated_sequence == seg_word_id)[0]
+    
+    if len(seg_indices) == 0:
+        logging.info("未找到独立的'seg' token，尝试在生成文本中查找...")
+        if SEG_TRIGGER_WORD in assistant_response.lower():
+            logging.info(f"在生成文本中找到'{SEG_TRIGGER_WORD}'，尝试定位...")
+            for i in range(len(generated_sequence) - 5, len(generated_sequence)):
+                if i >= 0:
+                    seg_indices = torch.tensor([i])
+                    break
+    
+    if len(seg_indices) == 0:
+        logging.info("尝试备选方案：查找<|seg_mask|> token...")
+        SEG_TOKEN = "<|seg_mask|>"
+        seg_token_id = tokenizer.convert_tokens_to_ids(SEG_TOKEN)
+        seg_indices = torch.where(generated_sequence == seg_token_id)[0]
         
-        # 找到第一个 [SEG] token 的位置
-        seg_index = torch.where(seg_token_mask)[0][0].item()
-
-        # seg_index 是相对于生成序列的位置，需要加1因为hidden_states包含了每个生成步骤
-        seg_step_index = seg_index + 1  # +1 因为第0步是输入
-        if seg_step_index < len(generate_outputs.hidden_states):
-            try:
-                seg_step_hidden_states = generate_outputs.hidden_states[seg_step_index]  # 不要用[-1]
-            except IndexError as e:
-                logging.error(f"Index error accessing hidden states: {e}")
-                logging.error(f"Hidden states length: {len(generate_outputs.hidden_states)}, seg_index: {seg_index}")
-                raise
-            seg_embedding = seg_step_hidden_states[:, -1, :]
-        else:
-            # 如果索引超出范围，使用最后一个隐藏状态
-            seg_step_hidden_states = generate_outputs.hidden_states[-1][-1]
-            # 需要找到对应的token位置
-            seg_position = qwen_inputs['input_ids'].shape[1] + seg_index
-            seg_embedding = seg_step_hidden_states[:, seg_position, :]
-        # 投影 [SEG] 嵌入
-        seg_embedding = seg_embedding.to(dtype=projected_seg_embedding.dtype)
-
-        projected_seg_embedding = model.text_hidden_fcs[0](seg_embedding)
-        logging.info(f"SEG token position: {seg_index}")
-        from torchvision.transforms import ToTensor
-        # 或者直接使用
-        image_tensor_for_sam = torch.from_numpy(np.array(pil_image)).permute(2, 0, 1).float() / 255.0
-        image_tensor_for_sam = image_tensor_for_sam.unsqueeze(0).to(model.device)
+        if len(seg_indices) > 0:
+            logging.info(f"找到 <|seg_mask|> token，ID: {seg_token_id}")
+    
+    if len(seg_indices) > 0:
+        seg_index = seg_indices[0].item()
+        logging.info(f"检测到分割触发信号，位置: {seg_index}。开始预测掩码...")
         
+        try:
+            seg_step_hidden_states = generate_outputs.hidden_states[seg_index]
+            last_layer_hidden_states = seg_step_hidden_states[-1]
+            seg_embedding = last_layer_hidden_states[:, -1, :]
+        except IndexError as e:
+            logging.error(f"索引 hidden_states 出错: {e}")
+            return None, "错误: 提取 token 嵌入时索引越界。"
+        
+        projected_seg_embedding = model.text_hidden_fcs[0](seg_embedding).to(dtype=model.dtype)
+        image_tensor_for_sam = qwen_inputs['pixel_values']
+        
+        # 添加调试信息
+        logging.info(f"传入SAM的图像张量形状: {image_tensor_for_sam.shape}")
+
         with torch.no_grad():
             sam_image_embedding = model.get_sam_image_embeddings(image_tensor_for_sam)
-            
-            # 使用SAM解码器进行预测
             sparse_embeddings, dense_embeddings = model.visual_model.prompt_encoder(
-                points=None, boxes=None, masks=None, text_embeds=projected_seg_embedding.unsqueeze(1)
-            )
+                points=None, boxes=None, masks=None, text_embeds=projected_seg_embedding.unsqueeze(1))
             sparse_embeddings = sparse_embeddings.to(projected_seg_embedding.dtype)
-
             low_res_masks, _ = model.visual_model.mask_decoder(
                 image_embeddings=sam_image_embedding,
                 image_pe=model.visual_model.prompt_encoder.get_dense_pe(),
                 sparse_prompt_embeddings=sparse_embeddings,
                 dense_prompt_embeddings=dense_embeddings,
-                multimask_output=False,
-            )
-            
-            # 后处理掩码
+                multimask_output=False)
             pred_mask_processed = model.visual_model.postprocess_masks(
                 low_res_masks,
-                input_size=pil_image.size[::-1], # (H, W)
-                original_size=image_cv_rgb.shape[:2] # (H, W)
-            )
+                input_size=pil_image.size[::-1],
+                original_size=image_cv_rgb.shape[:2])
             
-            print(f"pred_mask_processed shape: {pred_mask_processed.shape}")
             if len(pred_mask_processed.shape) >= 2:
-                predicted_mask = (pred_mask_processed[0, 0] > 0).cpu().numpy()
+                predicted_mask = (pred_mask_processed[0, 0] > model.visual_model.mask_threshold).cpu().numpy()
+                logging.info(f"掩码预测完成，形状: {predicted_mask.shape}")
             else:
-                logging.error(f"Unexpected mask shape: {pred_mask_processed.shape}")
-            logging.info(f"掩码预测完成，形状: {predicted_mask.shape}")
+                logging.error(f"预测掩码形状异常: {pred_mask_processed.shape}")
     else:
-        logging.warning("模型未生成 [SEG] token，跳过掩码预测。")
+        logging.warning("模型未生成分割触发信号，跳过掩码预测。")
 
     return predicted_mask, assistant_response
 
@@ -227,58 +192,66 @@ def main():
     
     torch_dtype = torch.bfloat16 if args.precision == "bf16" else (torch.half if args.precision == "fp16" else torch.float32)
 
-    # 先加载 tokenizer 和 processor
+    logging.info(f"正在从 {args.model_path} 加载Tokenizer和Processor...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=False, trust_remote_code=True)
     processor = AutoProcessor.from_pretrained(args.model_path, use_fast=False, trust_remote_code=True)
-    
-    # 添加特殊tokens - 确保它们被正确添加
-    # special_tokens = ["[SEG]", "<think>", "</think>", "<answer>", "</answer>"]
-    
-    # # 检查这些 tokens 是否已经存在
-    # existing_special_tokens = tokenizer.special_tokens_map.get('additional_special_tokens', [])
-    # tokens_to_add = [token for token in special_tokens if token not in existing_special_tokens and token not in tokenizer.get_vocab()]
-    
-    # if tokens_to_add:
-    #     num_added_tokens = tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
-    #     logging.info(f"Added {num_added_tokens} special tokens: {tokens_to_add}")
-    
-    # # 验证 tokens 是否被正确添加
-    # seg_token_id = tokenizer.convert_tokens_to_ids("[SEG]")
-    # logging.info(f"[SEG] token ID: {seg_token_id}")
-    # logging.info(f"[SEG] in vocab: {'[SEG]' in tokenizer.get_vocab()}")
-    
-    # # 如果 seg_token_id 是 tokenizer.unk_token_id，说明没有正确添加
-    # if seg_token_id == tokenizer.unk_token_id:
-    #     logging.error("[SEG] token was not properly added to vocabulary!")
-    # # 确保在加载模型时传递所有必要的自定义参数
 
-    # 验证 [SEG] 用 extra token
-    seg_token_str = "<|extra_0|>"  # 可根据需要调整 N，确保在 vocab 中
-    seg_token_id = tokenizer.convert_tokens_to_ids(seg_token_str)
-    logging.info(f"[SEG] token str: {seg_token_str}, ID: {seg_token_id}")
-    logging.info(f"[SEG] tokenized: {tokenizer.tokenize(seg_token_str)}")  # 应为单一 token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     
-    if seg_token_id == tokenizer.unk_token_id:
-        logging.error("[SEG] token was not properly added to vocabulary! Check extra token availability.")
+    # ==================== 简化的Token添加逻辑 ====================
+    logging.info("检查和添加必要的特殊Token...")
+    
+    # 检查'seg'是否已在词汇表中
+    seg_word = "seg"
+    seg_token_id = tokenizer.convert_tokens_to_ids(seg_word)
+    
+    if seg_token_id != tokenizer.unk_token_id:
+        logging.info(f"触发词 '{seg_word}' 已在词汇表中，ID: {seg_token_id}")
+    else:
+        logging.warning(f"触发词 '{seg_word}' 不在词汇表中，将尝试其他方法")
+    
+    # 添加其他可能需要的token
+    custom_tokens_to_add = ["<|seg_mask|>", "<think>", "</think>", "<answer>", "</answer>"]
+    tokens_to_add = []
+    
+    for token in custom_tokens_to_add:
+        if tokenizer.convert_tokens_to_ids(token) == tokenizer.unk_token_id:
+            tokens_to_add.append(token)
+    
+    if tokens_to_add:
+        num_added_tokens = tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
+        logging.info(f"成功添加 {num_added_tokens} 个新token: {tokens_to_add}")
+    else:
+        logging.info("所有必要的token已存在")
+        num_added_tokens = 0
+    
+    # 最终验证
+    final_seg_token_id = tokenizer.convert_tokens_to_ids("<|seg_mask|>")
+    logging.info(f"备选 <|seg_mask|> token ID: {final_seg_token_id}")
+    # ==========================================================
+
+    logging.info("正在加载QWSA模型...")
     model = QWSAForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=torch_dtype,
         trust_remote_code=True,
         vision_pretrained=args.sam_checkpoint,
         image_size=args.image_size,
-        seg_token_idx = tokenizer.convert_tokens_to_ids("<|extra_0|>"),
-        train_mask_decoder=True, # 假设在训练时是True
-        out_dim=256 # 与训练时保持一致
+        seg_token_idx=final_seg_token_id,  # 使用<|seg_mask|>的ID作为备选
+        train_mask_decoder=True,
+        out_dim=256
     ).cuda().eval()
-    model.config.output_hidden_states = True
-    # if tokens_to_add:
-    #     model.resize_token_embeddings(len(tokenizer))
-    #     logging.info(f"Resized model embeddings to {len(tokenizer)}")
     
+    if num_added_tokens > 0:
+        model.resize_token_embeddings(len(tokenizer))
+        logging.info(f"模型词嵌入层大小已调整为 {len(tokenizer)}")
+    
+    model.config.output_hidden_states = True
     logging.info("模型加载完成。")
+
     predicted_mask, text_response = inference(model, tokenizer, processor, args.image_path, args.prompt, args)
 
-    # --- 结果保存 ---
     if text_response:
         base_filename = os.path.splitext(os.path.basename(args.image_path))[0]
         text_save_path = os.path.join(args.out_dir, f"{base_filename}_response.txt")
@@ -291,15 +264,13 @@ def main():
             cv2.imwrite(mask_save_path, predicted_mask.astype(np.uint8) * 255)
             logging.info(f"分割掩码已保存到: {mask_save_path}")
 
-            # 创建覆盖图像
             overlay_save_path = os.path.join(args.out_dir, f"{base_filename}_overlay.jpg")
             original_image_bgr = cv2.imread(args.image_path)
             if predicted_mask.shape != original_image_bgr.shape[:2]:
                 predicted_mask = cv2.resize(predicted_mask.astype(np.uint8), (original_image_bgr.shape[1], original_image_bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
             
-            overlay_color = np.array([0, 0, 255], dtype=np.uint8) # 红色 (BGR)
+            overlay_color = np.array([0, 0, 255], dtype=np.uint8)
             overlay = original_image_bgr.copy()
-            # 将掩码转为布尔型，用于索引
             bool_mask = predicted_mask.astype(bool)
             overlay[bool_mask] = cv2.addWeighted(overlay[bool_mask], 0.5, overlay_color, 0.5, 0)
             cv2.imwrite(overlay_save_path, overlay)
